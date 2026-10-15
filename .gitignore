@@ -1,0 +1,14 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor and OS
+*.swp
+*~
+.DS_Store
+
+# Backups and scratch copies
+*.bak
+*.orig

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.csfh.rebar",
+  "name": "Rebar",
+  "version": "0.1.0",
+  "author": "hallas",
+  "license": "MIT",
+  "description": "Omarchy bar plugin: set the bar's background and foreground colors, and add a resizable gap exactly in the center.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Rebar",
+    "description": "Omarchy bar plugin: set the bar's background and foreground colors, and add a resizable gap exactly in the center.",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

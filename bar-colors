@@ -1,0 +1,277 @@
+#!/bin/bash
+# bar-colors: read and write the Omarchy bar's color overrides.
+#
+# Overrides live in the [bar] section of ~/.config/omarchy/shell.toml. That file
+# is the user layer on top of the active theme: the shell watches it, applies
+# changes live, and keeps them across theme switches. Only the keys below are
+# touched; every other section and key is left exactly as found.
+#
+#   bar-colors get                      print the overrides (key=value lines)
+#   bar-colors set <key> <value>        key: background | foreground | alpha
+#   bar-colors reset [key ...]          drop overrides (no key = all of them)
+#   bar-colors transparent <true|false> turn the bar's transparent mode on/off
+#   bar-colors spacer on [width]        add a gap exactly in the center of the bar
+#   bar-colors spacer width <px>        resize it
+#   bar-colors spacer off               remove it and restore the previous anchor
+#
+# BAR_COLORS_FILE, BAR_LAYOUT_FILE and BAR_COLORS_STATE override the paths
+# (used for testing on copies).
+
+set -euo pipefail
+
+shell_config="${BAR_COLORS_FILE:-$HOME/.config/omarchy/shell.toml}"
+
+fail() {
+  echo "bar-colors: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Map a friendly key to the shell.toml key it controls.
+toml_key() {
+  case "$1" in
+    background | bg) echo "background" ;;
+    foreground | text | fg) echo "text" ;;
+    alpha | background-alpha) echo "background-alpha" ;;
+    *) fail "unknown key '$1' (use background, foreground or alpha)" ;;
+  esac
+}
+
+# Print the value for a key, formatted the way it is written to the file.
+normalize() {
+  local key="$1" value="$2"
+  case "$key" in
+    background | text)
+      value="${value#\#}"
+      [[ $value =~ ^[0-9a-fA-F]{3}$ ]] && value="${value:0:1}${value:0:1}${value:1:1}${value:1:1}${value:2:1}${value:2:1}"
+      [[ $value =~ ^[0-9a-fA-F]{6}$ ]] || fail "'$2' is not a hex color (use #RGB or #RRGGBB)"
+      printf '"#%s"\n' "${value,,}"
+      ;;
+    background-alpha)
+      [[ $value =~ ^(0|1|0?\.[0-9]+|1\.0+)$ ]] || fail "'$value' is not an alpha between 0 and 1"
+      [[ $value == .* ]] && value="0$value"
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+# Print the current value of a [bar] key, or nothing if it is not overridden.
+current() {
+  [[ -f $shell_config ]] || return 0
+  awk -v key="$1" '
+    /^[[:space:]]*\[/ { in_bar = ($0 ~ /^[[:space:]]*\[bar\]([[:space:]]|$)/); next }
+    in_bar && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*/, "", v)
+      if (v ~ /^["\x27]/) {
+        q = substr(v, 1, 1)
+        v = substr(v, 2)
+        v = substr(v, 1, index(v, q) - 1)
+      } else {
+        sub(/[[:space:]]*(#.*)?$/, "", v)
+      }
+      print v
+      exit
+    }
+  ' "$shell_config"
+}
+
+# Upsert a key under [bar]: replace it in place, insert it into an existing
+# [bar] section, or append a fresh [bar] section.
+upsert() {
+  local key="$1" value="$2" tmp
+  mkdir -p "$(dirname "$shell_config")"
+
+  if [[ ! -f $shell_config ]]; then
+    printf '[bar]\n%s = %s\n' "$key" "$value" >"$shell_config"
+    return
+  fi
+
+  tmp="$(mktemp "$shell_config.XXXXXX")"
+  awk -v key="$key" -v val="$value" '
+    function emit() { print key " = " val; done = 1 }
+    /^[[:space:]]*\[/ {
+      if (in_bar && !done) emit()
+      in_bar = ($0 ~ /^[[:space:]]*\[bar\]([[:space:]]|$)/)
+      if (in_bar) seen_bar = 1
+      print
+      next
+    }
+    in_bar && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      if (!done) emit()
+      next
+    }
+    { print }
+    END {
+      if (in_bar && !done) emit()
+      if (!done) {
+        if (NR > 0) print ""
+        print "[bar]"
+        emit()
+      }
+    }
+  ' "$shell_config" >"$tmp"
+  mv "$tmp" "$shell_config"
+}
+
+# Drop a key from [bar], returning it to the theme value.
+drop() {
+  local key="$1" tmp
+  [[ -f $shell_config ]] || return 0
+  tmp="$(mktemp "$shell_config.XXXXXX")"
+  awk -v key="$key" '
+    /^[[:space:]]*\[/ { in_bar = ($0 ~ /^[[:space:]]*\[bar\]([[:space:]]|$)/) }
+    in_bar && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { next }
+    { print }
+  ' "$shell_config" >"$tmp"
+  mv "$tmp" "$shell_config"
+}
+
+# ---- center spacer ----------------------------------------------------------
+#
+# The bar pins only its `centerAnchor` widget to the exact middle; everything
+# else in the center section flows outward from it. So a gap that is truly
+# centered has to be the anchor itself: turning the spacer on inserts an
+# omarchy.spacer entry just before the current anchor and makes it the anchor,
+# turning it off removes it and puts the previous anchor back.
+
+layout_config="${BAR_LAYOUT_FILE:-$HOME/.config/omarchy/shell.json}"
+state_file="${BAR_COLORS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dev.csfh.rebar/spacer.json}"
+spacer_id="omarchy.spacer"
+default_width=40
+
+# Rewrite shell.json through a jq filter; the shell hot-reloads it on save.
+edit_layout() {
+  local tmp
+  [[ -f $layout_config ]] || fail "$layout_config not found"
+  tmp="$(mktemp "$layout_config.XXXXXX")"
+  if ! jq "$@" "$layout_config" >"$tmp"; then
+    rm -f "$tmp"
+    fail "could not edit $layout_config"
+  fi
+  mv "$tmp" "$layout_config"
+  # Tell the running shell to re-read the file (what Omarchy's own `omarchy bar`
+  # commands do). Without it the shell keeps its stale copy and writes it back
+  # over this edit the next time it persists, e.g. on a restart.
+  [[ -n ${BAR_LAYOUT_FILE:-} ]] || omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
+}
+
+spacer_is_on() {
+  [[ -f $layout_config ]] || return 1
+  jq -e --arg id "$spacer_id" '
+    .bar.centerAnchor == $id and any(.bar.layout.center[]?; .id == $id)
+  ' "$layout_config" >/dev/null 2>&1
+}
+
+# Remembered width, so toggling off and on keeps the size the user picked.
+saved_width() {
+  local w=""
+  [[ -f $state_file ]] && w="$(jq -r '.width // empty' "$state_file" 2>/dev/null)"
+  echo "${w:-$default_width}"
+}
+
+check_width() {
+  [[ ${1:-} =~ ^[0-9]+$ ]] && (($1 >= 1 && $1 <= 2000)) || fail "'${1:-}' is not a width between 1 and 2000"
+}
+
+save_state() { # <previous-anchor-or-empty> <width>
+  mkdir -p "$(dirname "$state_file")"
+  jq -n --arg anchor "$1" --argjson width "$2" \
+    '{anchor: (if $anchor == "" then null else $anchor end), width: $width}' >"$state_file"
+}
+
+spacer_get() {
+  if spacer_is_on; then
+    echo "spacer=on"
+    echo "spacer-width=$(jq -r --arg id "$spacer_id" '[.bar.layout.center[] | select(.id == $id)][0].size // 12' "$layout_config")"
+  else
+    echo "spacer=off"
+    echo "spacer-width=$(saved_width)"
+  fi
+}
+
+spacer_on() {
+  local width="${1:-$(saved_width)}" previous
+  check_width "$width"
+  if spacer_is_on; then
+    spacer_width_set "$width"
+    return
+  fi
+  jq -e --arg id "$spacer_id" 'any(.bar.layout.center[]?; .id == $id)' "$layout_config" >/dev/null 2>&1 &&
+    fail "the center section already has a spacer; remove it first"
+
+  previous="$(jq -r '.bar.centerAnchor // empty' "$layout_config")"
+  save_state "$previous" "$width"
+  edit_layout --arg id "$spacer_id" --argjson w "$width" '
+    .bar.layout.center as $c
+    | (.bar.centerAnchor // null) as $a
+    | ([range(0; $c | length)] | map(select($c[.].id == $a)) | first
+        // (($c | length) / 2 | floor)) as $i
+    | .bar.layout.center = ($c[:$i] + [{id: $id, size: $w}] + $c[$i:])
+    | .bar.centerAnchor = $id'
+}
+
+spacer_off() {
+  spacer_is_on || return 0
+  local previous=""
+  [[ -f $state_file ]] && previous="$(jq -r '.anchor // empty' "$state_file")"
+  edit_layout --arg id "$spacer_id" --arg prev "$previous" '
+    .bar.layout.center |= map(select(.id != $id))
+    | if $prev == "" then del(.bar.centerAnchor) else .bar.centerAnchor = $prev end'
+  save_state "" "$(saved_width)"
+}
+
+spacer_width_set() {
+  check_width "${1:-}"
+  save_state "$(jq -r '.anchor // empty' "$state_file" 2>/dev/null)" "$1"
+  spacer_is_on || return 0
+  edit_layout --arg id "$spacer_id" --argjson w "$1" '
+    .bar.layout.center |= map(if .id == $id then .size = $w else . end)'
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+  get)
+    for key in background text background-alpha; do
+      echo "$key=$(current "$key")"
+    done
+    spacer_get
+    ;;
+  spacer)
+    case "${1:-}" in
+      on) spacer_on "${2:-}" ;;
+      off) spacer_off ;;
+      width) spacer_width_set "${2:-}" ;;
+      get) spacer_get ;;
+      *) fail "usage: bar-colors spacer <on [width]|off|width <px>|get>" ;;
+    esac
+    ;;
+  set)
+    (($# == 2)) || fail "usage: bar-colors set <background|foreground|alpha> <value>"
+    key="$(toml_key "$1")"
+    upsert "$key" "$(normalize "$key" "$2")"
+    ;;
+  reset)
+    if (($# == 0)); then
+      set -- background foreground alpha
+    fi
+    for name in "$@"; do
+      drop "$(toml_key "$name")"
+    done
+    ;;
+  transparent)
+    [[ ${1:-} == true || ${1:-} == false ]] || fail "usage: bar-colors transparent <true|false>"
+    exec omarchy bar transparent "$1"
+    ;;
+  "" | -h | --help | help)
+    usage
+    ;;
+  *)
+    fail "unknown command '$cmd' (try --help)"
+    ;;
+esac
