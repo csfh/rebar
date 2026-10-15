@@ -91,22 +91,28 @@ upsert() {
   fi
 
   tmp="$(mktemp "$shell_config.XXXXXX")"
+  # Blank lines at the end of [bar] are held back so a new key lands with its
+  # own section, not after the gap that precedes the next one.
   awk -v key="$key" -v val="$value" '
     function emit() { print key " = " val; done = 1 }
+    function flush() { printf "%s", blanks; blanks = "" }
     /^[[:space:]]*\[/ {
       if (in_bar && !done) emit()
+      flush()
       in_bar = ($0 ~ /^[[:space:]]*\[bar\]([[:space:]]|$)/)
-      if (in_bar) seen_bar = 1
       print
       next
     }
+    in_bar && /^[[:space:]]*$/ { blanks = blanks $0 "\n"; next }
     in_bar && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      flush()
       if (!done) emit()
       next
     }
-    { print }
+    { flush(); print }
     END {
       if (in_bar && !done) emit()
+      flush()
       if (!done) {
         if (NR > 0) print ""
         print "[bar]"
@@ -254,14 +260,18 @@ case "$cmd" in
   set)
     (($# == 2)) || fail "usage: bar-colors set <background|foreground|alpha> <value>"
     key="$(toml_key "$1")"
-    upsert "$key" "$(normalize "$key" "$2")"
+    # Assign first: `fail` inside an argument's command substitution would only
+    # exit that subshell and the script would go on to write an empty value.
+    value="$(normalize "$key" "$2")"
+    upsert "$key" "$value"
     ;;
   reset)
     if (($# == 0)); then
       set -- background foreground alpha
     fi
     for name in "$@"; do
-      drop "$(toml_key "$name")"
+      key="$(toml_key "$name")"
+      drop "$key"
     done
     ;;
   transparent)

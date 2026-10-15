@@ -43,6 +43,12 @@ The repo directory is the source; the installed directory is a copy, so re-copy 
 The shell caches QML files and each plugin directory's file listing, so a QML edit (or a new file)
 only takes effect after `omarchy restart shell`. (`bar-colors` is run fresh each time, so edits to it apply immediately.)
 
+## Tests
+
+    tests/run
+
+Needs only bash, awk and jq, and runs against scratch copies of the config files.
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Christoffer Hallas.

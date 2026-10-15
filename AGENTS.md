@@ -13,6 +13,8 @@ Rebar is an Omarchy 4.x bar widget plugin: `manifest.json`, `Widget.qml` (bar ic
 
 ## Working on it
 
+- Run `tests/run` (bash, awk and jq only; `tests/run <pattern>` runs a subset). It uses scratch copies and a
+  stub `omarchy`, so it never touches the live config. Add a test for every change to `bar-colors`.
 - Test `bar-colors` on copies, never the live files: set `BAR_COLORS_FILE`, `BAR_LAYOUT_FILE` and
   `BAR_COLORS_STATE` to scratch paths. When `BAR_LAYOUT_FILE` is set the script does not reload the shell.
 - After editing `shell.json` for real, the script runs `omarchy-shell shell reloadConfig`. Without it the

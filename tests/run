@@ -1,0 +1,380 @@
+#!/bin/bash
+# Tests for bar-colors. No dependencies beyond bash, awk and jq.
+#
+# Every test runs against scratch copies of shell.toml, shell.json and the
+# spacer state file (via BAR_COLORS_FILE, BAR_LAYOUT_FILE, BAR_COLORS_STATE),
+# with a stub `omarchy` on PATH, so nothing here touches the live desktop.
+#
+#   tests/run              run everything
+#   tests/run <pattern>    run only tests whose name matches the pattern
+
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script="$root/bar-colors"
+filter="${1:-}"
+
+passed=0
+failed=0
+current=""
+work=""
+
+# ---- harness ---------------------------------------------------------------
+
+setup() {
+  work="$(mktemp -d)"
+  export BAR_COLORS_FILE="$work/shell.toml"
+  export BAR_LAYOUT_FILE="$work/shell.json"
+  export BAR_COLORS_STATE="$work/state/spacer.json"
+  export STUB_LOG="$work/omarchy.log"
+  mkdir -p "$work/bin"
+  printf '#!/bin/sh\necho "$@" >> "$STUB_LOG"\n' >"$work/bin/omarchy"
+  chmod +x "$work/bin/omarchy"
+  export PATH="$work/bin:$PATH"
+}
+
+teardown() {
+  rm -rf "$work"
+}
+
+bad() {
+  echo "  FAIL [$current]: $*"
+  failed=$((failed + 1))
+  test_failed=1
+}
+
+# assert_eq <expected> <actual> <what>
+assert_eq() {
+  [[ $1 == "$2" ]] || bad "$3: expected '$1', got '$2'"
+}
+
+# assert_fails <what> <command...>: the command must exit non-zero and say something
+assert_fails() {
+  local what="$1" out
+  shift
+  if out="$("$@" 2>&1)"; then
+    bad "$what: expected a non-zero exit"
+  elif [[ -z $out ]]; then
+    bad "$what: failed without an error message"
+  fi
+}
+
+# assert_json_same <fileA> <fileB> <what>: equal as JSON, ignoring key order
+assert_json_same() {
+  [[ "$(jq -S . "$1")" == "$(jq -S . "$2")" ]] || bad "$3: JSON differs"
+}
+
+# Read one key from `bar-colors get`.
+get() { "$script" get | sed -n "s/^$1=//p"; }
+
+layout() {
+  jq -c '[.bar.layout.center[] | .id + (if .size then ":" + (.size | tostring) else "" end)]' "$BAR_LAYOUT_FILE"
+}
+
+anchor() { jq -r '.bar.centerAnchor // "none"' "$BAR_LAYOUT_FILE"; }
+
+write_layout() {
+  cat >"$BAR_LAYOUT_FILE" <<'JSON'
+{
+  "version": 1,
+  "bar": {
+    "centerAnchor": "omarchy.clock",
+    "position": "top",
+    "transparent": true,
+    "layout": {
+      "left": [{ "id": "omarchy.menu" }],
+      "center": [
+        { "id": "omarchy.weather", "refreshMinutes": 15 },
+        { "id": "omarchy.clock", "format": "HH:mm" }
+      ],
+      "right": [{ "id": "omarchy.audio" }]
+    }
+  }
+}
+JSON
+}
+
+run_test() {
+  current="$1"
+  [[ -z $filter || $current == *"$filter"* ]] || return 0
+  test_failed=0
+  setup
+  "$current"
+  teardown
+  if ((test_failed == 0)); then
+    passed=$((passed + 1))
+  fi
+}
+
+# ---- colors ----------------------------------------------------------------
+
+test_set_creates_bar_section_in_missing_file() {
+  "$script" set background '#1e1e2e'
+  assert_eq $'[bar]\nbackground = "#1e1e2e"' "$(cat "$BAR_COLORS_FILE")" "file contents"
+}
+
+test_set_normalizes_hex() {
+  "$script" set background '#1E1E2E'
+  assert_eq '#1e1e2e' "$(get background)" "uppercase hex is lowercased"
+  "$script" set background 112233
+  assert_eq '#112233' "$(get background)" "leading # is optional"
+  "$script" set foreground fa0
+  assert_eq '#ffaa00' "$(get text)" "3-digit hex is expanded"
+}
+
+test_foreground_is_stored_as_text() {
+  "$script" set foreground '#ffffff'
+  grep -q '^text = "#ffffff"$' "$BAR_COLORS_FILE" || bad "no text key written"
+  assert_eq '#ffffff' "$(get text)" "foreground reads back as text"
+}
+
+test_alpha() {
+  "$script" set alpha .8
+  assert_eq '0.8' "$(get background-alpha)" ".8 is normalized to 0.8"
+  "$script" set alpha 1
+  assert_eq '1' "$(get background-alpha)" "alpha 1"
+  assert_fails "alpha above 1" "$script" set alpha 2
+  assert_fails "alpha not a number" "$script" set alpha abc
+}
+
+test_set_replaces_in_place_and_keeps_everything_else() {
+  cat >"$BAR_COLORS_FILE" <<'EOF'
+[font]
+base-size = 14
+
+[bar]
+background = "#000000"
+size-horizontal = 26
+
+[controls]
+normal-fill-alpha = 0.04
+EOF
+  "$script" set background '#ffffff'
+  assert_eq $'[font]\nbase-size = 14\n\n[bar]\nbackground = "#ffffff"\nsize-horizontal = 26\n\n[controls]\nnormal-fill-alpha = 0.04' \
+    "$(cat "$BAR_COLORS_FILE")" "only the one line changed"
+}
+
+test_set_inserts_into_existing_bar_before_next_section() {
+  printf '[bar]\nsize-horizontal = 26\n\n[font]\nbase-size = 14\n' >"$BAR_COLORS_FILE"
+  "$script" set foreground '#fde68a'
+  assert_eq $'[bar]\nsize-horizontal = 26\ntext = "#fde68a"\n\n[font]\nbase-size = 14' \
+    "$(cat "$BAR_COLORS_FILE")" "inserted at the end of [bar]"
+}
+
+test_set_appends_bar_section_after_other_sections() {
+  printf '[font]\nbase-size = 14\n' >"$BAR_COLORS_FILE"
+  "$script" set background '#000000'
+  assert_eq $'[font]\nbase-size = 14\n\n[bar]\nbackground = "#000000"' "$(cat "$BAR_COLORS_FILE")" "new section"
+}
+
+test_key_in_another_section_is_not_touched() {
+  printf '[popups]\nbackground = "#111111"\n\n[bar]\nbackground = "#222222"\n' >"$BAR_COLORS_FILE"
+  "$script" set background '#333333'
+  grep -A1 '^\[popups\]' "$BAR_COLORS_FILE" | grep -q '#111111' || bad "[popups] background changed"
+  assert_eq '#333333' "$(get background)" "[bar] background"
+}
+
+test_get_handles_hash_inside_quotes_and_trailing_comments() {
+  printf '[bar]\nbackground = "#112233"   # mine\ntext = "#ffaa00"\nbackground-alpha = 0.5 # half\n' >"$BAR_COLORS_FILE"
+  assert_eq '#112233' "$(get background)" "quoted value with a comment after it"
+  assert_eq '#ffaa00' "$(get text)" "plain quoted value"
+  assert_eq '0.5' "$(get background-alpha)" "bare number with a comment after it"
+}
+
+test_get_with_no_file_reports_nothing_overridden() {
+  assert_eq '' "$(get background)" "background"
+  assert_eq '' "$(get text)" "text"
+}
+
+test_invalid_input_is_rejected_and_leaves_the_file_alone() {
+  printf '[bar]\nbackground = "#112233"\n' >"$BAR_COLORS_FILE"
+  local before
+  before="$(cat "$BAR_COLORS_FILE")"
+  assert_fails "non-hex color" "$script" set background zzz
+  assert_fails "4-digit hex" "$script" set background '#abcd'
+  assert_fails "8-digit hex" "$script" set background '#aabbccdd'
+  assert_fails "unknown key" "$script" set nope '#ffffff'
+  assert_fails "wrong argument count" "$script" set background
+  assert_eq "$before" "$(cat "$BAR_COLORS_FILE")" "file unchanged after rejected input"
+}
+
+test_reset_one_key() {
+  "$script" set background '#111111'
+  "$script" set foreground '#eeeeee'
+  "$script" reset foreground
+  assert_eq '#111111' "$(get background)" "background kept"
+  assert_eq '' "$(get text)" "foreground dropped"
+}
+
+test_reset_all_keeps_other_sections() {
+  printf '[font]\nbase-size = 14\n' >"$BAR_COLORS_FILE"
+  "$script" set background '#111111'
+  "$script" set foreground '#eeeeee'
+  "$script" set alpha 0.5
+  "$script" reset
+  assert_eq '' "$(get background)$(get text)$(get background-alpha)" "all overrides dropped"
+  grep -q '^base-size = 14$' "$BAR_COLORS_FILE" || bad "[font] lost"
+}
+
+test_reset_unknown_key_is_rejected() {
+  "$script" set background '#111111'
+  local before
+  before="$(cat "$BAR_COLORS_FILE")"
+  assert_fails "unknown key" "$script" reset nope
+  assert_eq "$before" "$(cat "$BAR_COLORS_FILE")" "file unchanged"
+}
+
+test_reset_with_no_file_is_fine() {
+  "$script" reset || bad "reset failed without a file"
+  [[ ! -e $BAR_COLORS_FILE ]] || bad "reset created a file"
+}
+
+test_transparent_delegates_to_omarchy() {
+  "$script" transparent false
+  assert_eq 'bar transparent false' "$(cat "$STUB_LOG")" "omarchy arguments"
+  assert_fails "invalid value" "$script" transparent maybe
+}
+
+# ---- center spacer ---------------------------------------------------------
+
+test_spacer_on_inserts_before_the_anchor_and_becomes_the_anchor() {
+  write_layout
+  "$script" spacer on
+  assert_eq '["omarchy.weather","omarchy.spacer:40","omarchy.clock"]' "$(layout)" "center layout"
+  assert_eq 'omarchy.spacer' "$(anchor)" "anchor"
+}
+
+test_spacer_on_uses_the_given_width() {
+  write_layout
+  "$script" spacer on 184
+  assert_eq '["omarchy.weather","omarchy.spacer:184","omarchy.clock"]' "$(layout)" "center layout"
+}
+
+test_spacer_off_restores_the_layout_exactly() {
+  write_layout
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  "$script" spacer on 90
+  "$script" spacer off
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout after on/off"
+}
+
+test_spacer_off_when_already_off_changes_nothing() {
+  write_layout
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  "$script" spacer off
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout"
+}
+
+test_spacer_on_twice_resizes_instead_of_duplicating() {
+  write_layout
+  "$script" spacer on 50
+  "$script" spacer on 70
+  assert_eq '["omarchy.weather","omarchy.spacer:70","omarchy.clock"]' "$(layout)" "center layout"
+  "$script" spacer off
+  assert_eq 'omarchy.clock' "$(anchor)" "anchor restored to the original, not the spacer"
+}
+
+test_spacer_width_resizes_when_on() {
+  write_layout
+  "$script" spacer on 40
+  "$script" spacer width 80
+  assert_eq '["omarchy.weather","omarchy.spacer:80","omarchy.clock"]' "$(layout)" "center layout"
+}
+
+test_spacer_width_is_remembered_while_off() {
+  write_layout
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  "$script" spacer width 120
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout untouched while off"
+  "$script" spacer on
+  assert_eq '["omarchy.weather","omarchy.spacer:120","omarchy.clock"]' "$(layout)" "width used on next on"
+}
+
+test_spacer_width_survives_off_and_on() {
+  write_layout
+  "$script" spacer on 90
+  "$script" spacer off
+  assert_eq '90' "$("$script" spacer get | sed -n 's/^spacer-width=//p')" "reported width while off"
+  "$script" spacer on
+  assert_eq '["omarchy.weather","omarchy.spacer:90","omarchy.clock"]' "$(layout)" "center layout"
+}
+
+test_spacer_get_reports_state() {
+  write_layout
+  assert_eq $'spacer=off\nspacer-width=40' "$("$script" spacer get)" "off"
+  "$script" spacer on 64
+  assert_eq $'spacer=on\nspacer-width=64' "$("$script" spacer get)" "on"
+}
+
+test_spacer_with_no_anchor_goes_in_the_middle_and_off_removes_the_anchor() {
+  write_layout
+  jq 'del(.bar.centerAnchor)' "$BAR_LAYOUT_FILE" >"$work/tmp.json" && mv "$work/tmp.json" "$BAR_LAYOUT_FILE"
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  "$script" spacer on
+  assert_eq '["omarchy.weather","omarchy.spacer:40","omarchy.clock"]' "$(layout)" "center layout"
+  "$script" spacer off
+  assert_eq 'none' "$(anchor)" "no anchor key left behind"
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout"
+}
+
+test_spacer_anchor_not_in_center_still_works() {
+  write_layout
+  jq '.bar.centerAnchor = "omarchy.missing"' "$BAR_LAYOUT_FILE" >"$work/tmp.json" && mv "$work/tmp.json" "$BAR_LAYOUT_FILE"
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  "$script" spacer on
+  assert_eq 'omarchy.spacer' "$(anchor)" "anchor"
+  "$script" spacer off
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout"
+}
+
+test_spacer_refuses_when_the_center_already_has_one() {
+  write_layout
+  jq '.bar.layout.center += [{"id": "omarchy.spacer", "size": 5}]' "$BAR_LAYOUT_FILE" >"$work/tmp.json" && mv "$work/tmp.json" "$BAR_LAYOUT_FILE"
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  assert_fails "foreign spacer" "$script" spacer on
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout unchanged"
+}
+
+test_spacer_rejects_bad_widths() {
+  write_layout
+  cp "$BAR_LAYOUT_FILE" "$work/original.json"
+  assert_fails "text" "$script" spacer on abc
+  assert_fails "zero" "$script" spacer on 0
+  assert_fails "negative" "$script" spacer on -5
+  assert_fails "too wide" "$script" spacer on 2001
+  assert_fails "width subcommand" "$script" spacer width x
+  assert_json_same "$work/original.json" "$BAR_LAYOUT_FILE" "layout unchanged"
+}
+
+test_spacer_leaves_other_bar_settings_alone() {
+  write_layout
+  "$script" spacer on 60
+  assert_eq 'true' "$(jq -r '.bar.transparent' "$BAR_LAYOUT_FILE")" "transparent"
+  assert_eq 'top' "$(jq -r '.bar.position' "$BAR_LAYOUT_FILE")" "position"
+  assert_eq '["omarchy.menu"]' "$(jq -c '[.bar.layout.left[].id]' "$BAR_LAYOUT_FILE")" "left section"
+  assert_eq '["omarchy.audio"]' "$(jq -c '[.bar.layout.right[].id]' "$BAR_LAYOUT_FILE")" "right section"
+}
+
+test_spacer_unknown_subcommand() {
+  write_layout
+  assert_fails "unknown spacer command" "$script" spacer sideways
+}
+
+test_unknown_command() {
+  assert_fails "unknown command" "$script" frobnicate
+}
+
+# ---- run -------------------------------------------------------------------
+
+for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
+  run_test "$t"
+done
+
+total=$((passed + failed))
+echo
+if ((failed == 0)); then
+  echo "OK: $passed tests passed"
+else
+  echo "FAILED: $failed assertion(s) failed ($passed tests passed)"
+  exit 1
+fi
